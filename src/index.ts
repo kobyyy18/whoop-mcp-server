@@ -381,14 +381,17 @@ async function main(): Promise<void> {
 		});
 
 		// ── Dynamic client registration (RFC 7591) ───────────────────────
-		app.post('/register', (_req: Request, res: Response) => {
-			// Single-user server — accept any registration and hand back static creds
+		// Return real WHOOP app credentials so Claude.ai can drive the OAuth flow
+		app.post('/register', (req: Request, res: Response) => {
+			const body = (req.body ?? {}) as Record<string, unknown>;
 			res.status(201).json({
-				client_id: 'whoop-mcp-client',
+				client_id: config.clientId,
+				client_secret: config.clientSecret,
 				client_secret_expires_at: 0,
+				redirect_uris: body.redirect_uris ?? [],
 				grant_types: ['authorization_code'],
 				response_types: ['code'],
-				token_endpoint_auth_method: 'none',
+				token_endpoint_auth_method: 'client_secret_post',
 			});
 		});
 
@@ -421,30 +424,56 @@ async function main(): Promise<void> {
 			res.redirect(whoopUrl.toString());
 		});
 
-		// ── /token — issue access token after code exchange ───────────────
-		app.post('/token', express.urlencoded({ extended: false }), (req: Request, res: Response) => {
-			const grantType = (req.body as Record<string, string>).grant_type;
-			const code      = (req.body as Record<string, string>).code;
+		// ── /token — proxy code exchange to WHOOP ────────────────────────
+		app.post('/token', express.urlencoded({ extended: false }), async (req: Request, res: Response) => {
+			const body      = (req.body ?? {}) as Record<string, string>;
+			const grantType = body.grant_type;
+			const code      = body.code;
 
 			if (grantType !== 'authorization_code') {
 				res.status(400).json({ error: 'unsupported_grant_type' });
 				return;
 			}
-
-			if (!code || !pendingCodes.has(code)) {
+			if (!code) {
 				res.status(400).json({ error: 'invalid_grant' });
 				return;
 			}
 
-			const accessToken = pendingCodes.get(code)!;
-			pendingCodes.delete(code);
+			try {
+				const whoopRes = await fetch('https://api.prod.whoop.com/oauth/oauth2/token', {
+					method: 'POST',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: new URLSearchParams({
+						grant_type:    'authorization_code',
+						code,
+						client_id:     config.clientId,
+						client_secret: config.clientSecret,
+						redirect_uri:  config.redirectUri,
+					}),
+				});
 
-			res.json({
-				access_token: accessToken,
-				token_type: 'bearer',
-				expires_in: 3600 * 24 * 365,
-				scope: 'read:recovery read:cycles read:sleep read:workout read:profile read:body_measurement offline',
-			});
+				const data = await whoopRes.json() as Record<string, unknown>;
+
+				if (!whoopRes.ok) {
+					res.status(whoopRes.status).json(data);
+					return;
+				}
+
+				// Store tokens so MCP tools can use them immediately
+				const tokens = {
+					access_token:  data.access_token  as string,
+					refresh_token: data.refresh_token as string,
+					expires_at:    Date.now() + ((data.expires_in as number ?? 3600) * 1000),
+				};
+				db.saveTokens(tokens);
+				client.setTokens(tokens);
+				sync.syncDays(90).catch(() => {});
+
+				res.json(data);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : 'Token exchange failed';
+				res.status(500).json({ error: 'server_error', error_description: message });
+			}
 		});
 
 		// ── /callback — WHOOP redirects here after user authorises ────────
@@ -462,33 +491,30 @@ async function main(): Promise<void> {
 				return;
 			}
 
-			try {
-				const tokens = await client.exchangeCodeForTokens(code);
-				db.saveTokens(tokens);
-				sync.syncDays(90).catch(() => {});
-			} catch {
-				res.status(500).send('Token exchange with WHOOP failed. Please try again.');
-				return;
-			}
-
-			// If this came from the Claude.ai OAuth proxy flow, redirect back
+			// OAuth proxy flow (Claude.ai): pass the WHOOP code straight through.
+			// Claude.ai will exchange it at /token, which proxies to WHOOP and
+			// stores the resulting tokens in SQLite.
 			if (state && oauthSessions.has(state)) {
 				const session = oauthSessions.get(state)!;
 				oauthSessions.delete(state);
 
-				const authCode = crypto.randomUUID();
-				pendingCodes.set(authCode, SERVER_TOKEN);
-				setTimeout(() => pendingCodes.delete(authCode), 5 * 60 * 1000);
-
 				const redirect = new URL(session.clientRedirectUri);
-				redirect.searchParams.set('code', authCode);
+				redirect.searchParams.set('code', code);
 				if (session.clientState) redirect.searchParams.set('state', session.clientState);
 
 				res.redirect(redirect.toString());
 				return;
 			}
 
-			res.send('Authorization successful! You can close this window and return to Claude.');
+			// Direct browser visit (no proxy session): exchange immediately and store
+			try {
+				const tokens = await client.exchangeCodeForTokens(code);
+				db.saveTokens(tokens);
+				sync.syncDays(90).catch(() => {});
+				res.send('Authorization successful! You can close this window and return to Claude.');
+			} catch {
+				res.status(500).send('Token exchange with WHOOP failed. Please try again.');
+			}
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
