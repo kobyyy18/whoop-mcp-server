@@ -19,7 +19,15 @@ const config = {
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
+	baseUrl: (process.env.BASE_URL ?? 'https://whoop-mcp-server-production-5dad.up.railway.app').replace(/\/$/, ''),
 };
+
+// OAuth 2.0 proxy state: maps our internal state → client's original redirect params
+const oauthSessions = new Map<string, { clientRedirectUri: string; clientState: string }>();
+// Short-lived auth codes issued to Claude.ai after WHOOP auth completes: code → access_token
+const pendingCodes = new Map<string, string>();
+// Stable server-level access token (persist across restarts via env var)
+const SERVER_TOKEN = process.env.MCP_ACCESS_TOKEN ?? crypto.randomUUID();
 
 const db = new WhoopDatabase(config.dbPath);
 const client = new WhoopClient({
@@ -343,8 +351,112 @@ async function main(): Promise<void> {
 		const app = express();
 		app.use(express.json());
 
+		// ── OAuth 2.0 discovery ─────────────────────────────────────────────
+		app.get('/.well-known/oauth-authorization-server', (_req: Request, res: Response) => {
+			res.json({
+				issuer: config.baseUrl,
+				authorization_endpoint: `${config.baseUrl}/authorize`,
+				token_endpoint: `${config.baseUrl}/token`,
+				registration_endpoint: `${config.baseUrl}/register`,
+				response_types_supported: ['code'],
+				grant_types_supported: ['authorization_code'],
+				token_endpoint_auth_methods_supported: ['none'],
+				scopes_supported: [
+					'read:recovery', 'read:cycles', 'read:sleep',
+					'read:workout', 'read:profile', 'read:body_measurement', 'offline',
+				],
+			});
+		});
+
+		app.get('/.well-known/oauth-protected-resource', (_req: Request, res: Response) => {
+			res.json({
+				resource: config.baseUrl,
+				authorization_servers: [config.baseUrl],
+				bearer_methods_supported: ['header'],
+				scopes_supported: [
+					'read:recovery', 'read:cycles', 'read:sleep',
+					'read:workout', 'read:profile', 'read:body_measurement', 'offline',
+				],
+			});
+		});
+
+		// ── Dynamic client registration (RFC 7591) ───────────────────────
+		app.post('/register', (_req: Request, res: Response) => {
+			// Single-user server — accept any registration and hand back static creds
+			res.status(201).json({
+				client_id: 'whoop-mcp-client',
+				client_secret_expires_at: 0,
+				grant_types: ['authorization_code'],
+				response_types: ['code'],
+				token_endpoint_auth_method: 'none',
+			});
+		});
+
+		// ── /authorize — proxy to WHOOP OAuth ────────────────────────────
+		app.get('/authorize', (req: Request, res: Response) => {
+			const redirectUri = req.query.redirect_uri as string | undefined;
+			const state       = req.query.state       as string | undefined;
+
+			if (!redirectUri) {
+				res.status(400).send('Missing redirect_uri');
+				return;
+			}
+
+			// Store client's params under a fresh proxy state
+			const proxyState = crypto.randomUUID();
+			oauthSessions.set(proxyState, {
+				clientRedirectUri: redirectUri,
+				clientState: state ?? '',
+			});
+			// Auto-expire session after 10 minutes
+			setTimeout(() => oauthSessions.delete(proxyState), 10 * 60 * 1000);
+
+			const whoopUrl = new URL('https://api.prod.whoop.com/oauth/oauth2/auth');
+			whoopUrl.searchParams.set('client_id', config.clientId);
+			whoopUrl.searchParams.set('redirect_uri', config.redirectUri);
+			whoopUrl.searchParams.set('response_type', 'code');
+			whoopUrl.searchParams.set('scope', 'read:recovery read:cycles read:sleep read:workout read:profile read:body_measurement offline');
+			whoopUrl.searchParams.set('state', proxyState);
+
+			res.redirect(whoopUrl.toString());
+		});
+
+		// ── /token — issue access token after code exchange ───────────────
+		app.post('/token', express.urlencoded({ extended: false }), (req: Request, res: Response) => {
+			const grantType = (req.body as Record<string, string>).grant_type;
+			const code      = (req.body as Record<string, string>).code;
+
+			if (grantType !== 'authorization_code') {
+				res.status(400).json({ error: 'unsupported_grant_type' });
+				return;
+			}
+
+			if (!code || !pendingCodes.has(code)) {
+				res.status(400).json({ error: 'invalid_grant' });
+				return;
+			}
+
+			const accessToken = pendingCodes.get(code)!;
+			pendingCodes.delete(code);
+
+			res.json({
+				access_token: accessToken,
+				token_type: 'bearer',
+				expires_in: 3600 * 24 * 365,
+				scope: 'read:recovery read:cycles read:sleep read:workout read:profile read:body_measurement offline',
+			});
+		});
+
+		// ── /callback — WHOOP redirects here after user authorises ────────
 		app.get('/callback', async (req: Request, res: Response) => {
-			const code = req.query.code as string | undefined;
+			const code  = req.query.code  as string | undefined;
+			const state = req.query.state as string | undefined;
+			const error = req.query.error as string | undefined;
+
+			if (error) {
+				res.status(400).send(`Authorization denied: ${error}`);
+				return;
+			}
 			if (!code) {
 				res.status(400).send('Missing authorization code');
 				return;
@@ -354,10 +466,29 @@ async function main(): Promise<void> {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
 				sync.syncDays(90).catch(() => {});
-				res.send('Authorization successful! You can close this window.');
 			} catch {
-				res.status(500).send('Authorization failed. Please try again.');
+				res.status(500).send('Token exchange with WHOOP failed. Please try again.');
+				return;
 			}
+
+			// If this came from the Claude.ai OAuth proxy flow, redirect back
+			if (state && oauthSessions.has(state)) {
+				const session = oauthSessions.get(state)!;
+				oauthSessions.delete(state);
+
+				const authCode = crypto.randomUUID();
+				pendingCodes.set(authCode, SERVER_TOKEN);
+				setTimeout(() => pendingCodes.delete(authCode), 5 * 60 * 1000);
+
+				const redirect = new URL(session.clientRedirectUri);
+				redirect.searchParams.set('code', authCode);
+				if (session.clientState) redirect.searchParams.set('state', session.clientState);
+
+				res.redirect(redirect.toString());
+				return;
+			}
+
+			res.send('Authorization successful! You can close this window and return to Claude.');
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
