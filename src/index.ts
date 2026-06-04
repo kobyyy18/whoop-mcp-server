@@ -15,7 +15,7 @@ interface ToolArguments {
 const config = {
 	clientId: process.env.WHOOP_CLIENT_ID ?? '',
 	clientSecret: process.env.WHOOP_CLIENT_SECRET ?? '',
-	redirectUri: process.env.WHOOP_REDIRECT_URI ?? 'http://localhost:3000/callback',
+	redirectUri: process.env.WHOOP_REDIRECT_URI ?? 'https://whoop-mcp-server-production-5dad.up.railway.app/callback',
 	dbPath: process.env.DB_PATH ?? './whoop.db',
 	port: Number.parseInt(process.env.PORT ?? '3000', 10),
 	mode: process.env.MCP_MODE ?? 'http',
@@ -430,6 +430,11 @@ async function main(): Promise<void> {
 			const grantType = body.grant_type;
 			const code      = body.code;
 
+			process.stdout.write(
+				`[token] grant_type=${grantType} code=${code ? `${code.slice(0, 8)}...` : 'missing'} ` +
+				`client_redirect_uri=${body.redirect_uri ?? 'none'} our_redirect_uri=${config.redirectUri}\n`
+			);
+
 			if (grantType !== 'authorization_code') {
 				res.status(400).json({ error: 'unsupported_grant_type' });
 				return;
@@ -440,19 +445,29 @@ async function main(): Promise<void> {
 			}
 
 			try {
+				const whoopPayload = new URLSearchParams({
+					grant_type:    'authorization_code',
+					code,
+					client_id:     config.clientId,
+					client_secret: config.clientSecret,
+					redirect_uri:  config.redirectUri,
+				});
+
+				process.stdout.write(`[token] → WHOOP token exchange redirect_uri=${config.redirectUri}\n`);
+
 				const whoopRes = await fetch('https://api.prod.whoop.com/oauth/oauth2/token', {
 					method: 'POST',
 					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-					body: new URLSearchParams({
-						grant_type:    'authorization_code',
-						code,
-						client_id:     config.clientId,
-						client_secret: config.clientSecret,
-						redirect_uri:  config.redirectUri,
-					}),
+					body: whoopPayload,
 				});
 
 				const data = await whoopRes.json() as Record<string, unknown>;
+
+				process.stdout.write(
+					`[token] ← WHOOP status=${whoopRes.status} ` +
+					`has_access_token=${Boolean(data.access_token)} ` +
+					`error=${data.error ?? 'none'}\n`
+				);
 
 				if (!whoopRes.ok) {
 					res.status(whoopRes.status).json(data);
@@ -469,9 +484,11 @@ async function main(): Promise<void> {
 				client.setTokens(tokens);
 				sync.syncDays(90).catch(() => {});
 
+				process.stdout.write('[token] tokens stored in SQLite\n');
 				res.json(data);
 			} catch (err) {
 				const message = err instanceof Error ? err.message : 'Token exchange failed';
+				process.stdout.write(`[token] exception: ${message}\n`);
 				res.status(500).json({ error: 'server_error', error_description: message });
 			}
 		});
@@ -482,7 +499,14 @@ async function main(): Promise<void> {
 			const state = req.query.state as string | undefined;
 			const error = req.query.error as string | undefined;
 
+			process.stdout.write(
+				`[callback] code=${code ? `${code.slice(0, 8)}...` : 'missing'} ` +
+				`state=${state ?? 'none'} error=${error ?? 'none'} ` +
+				`session_found=${state ? oauthSessions.has(state) : false}\n`
+			);
+
 			if (error) {
+				process.stdout.write(`[callback] denied by WHOOP: ${error}\n`);
 				res.status(400).send(`Authorization denied: ${error}`);
 				return;
 			}
@@ -502,17 +526,22 @@ async function main(): Promise<void> {
 				redirect.searchParams.set('code', code);
 				if (session.clientState) redirect.searchParams.set('state', session.clientState);
 
+				process.stdout.write(`[callback] proxy redirect → ${redirect.origin}${redirect.pathname}\n`);
 				res.redirect(redirect.toString());
 				return;
 			}
 
-			// Direct browser visit (no proxy session): exchange immediately and store
+			// Direct browser visit (no proxy session): exchange immediately and store.
+			// This also fires if the server restarted mid-flow and lost the session.
+			process.stdout.write('[callback] no session found — exchanging directly with WHOOP\n');
 			try {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
 				sync.syncDays(90).catch(() => {});
 				res.send('Authorization successful! You can close this window and return to Claude.');
-			} catch {
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				process.stdout.write(`[callback] direct exchange failed: ${message}\n`);
 				res.status(500).send('Token exchange with WHOOP failed. Please try again.');
 			}
 		});
